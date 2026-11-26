@@ -7243,6 +7243,10 @@ fn streams_by_donor_handles_default_cap() {
     assert_eq!(streams.len(), 100);
 }
 
+// ── resume_stream edge cases (issue #449) ──────────────────────────────────
+
+/// A fresh 1_000-deposit, 10/s stream created at ledger time 0.
+fn resume_fixture(s: &Setup<'_>) -> u64 {
 // =============================================================================
 // Accrual stops while a stream is paused (issue #450)
 // =============================================================================
@@ -7261,6 +7265,117 @@ fn paused_test_stream(s: &Setup) -> u64 {
 }
 
 #[test]
+fn resume_stream_on_a_paused_stream_reactivates_it_without_accruing_paused_time() {
+    let s = setup();
+    let stream_id = resume_fixture(&s);
+
+    s.env.ledger().with_mut(|l| l.timestamp += 10);
+    assert_eq!(s.client.pause_stream(&stream_id), 100);
+
+    // 500 seconds pass while paused: none of it may accrue.
+    s.env.ledger().with_mut(|l| l.timestamp += 500);
+    s.client.resume_stream(&stream_id);
+    assert_eq!(
+        count_events_with_topic(&s.env, Symbol::new(&s.env, "strmresume")),
+        1
+    );
+
+    let resumed = s.client.get_stream(&stream_id);
+    assert_eq!(resumed.status, StreamStatus::Active);
+    assert_eq!(resumed.balance, 900);
+    assert_eq!(resumed.last_update, 510);
+    assert_eq!(s.client.pending_accrual(&stream_id), 0);
+
+    s.env.ledger().with_mut(|l| l.timestamp += 20);
+    assert_eq!(s.client.pending_accrual(&stream_id), 200);
+}
+
+#[test]
+fn resume_stream_on_an_active_stream_fails_with_not_paused() {
+    let s = setup();
+    let stream_id = resume_fixture(&s);
+    s.env.ledger().with_mut(|l| l.timestamp += 10);
+    let before = s.client.get_stream(&stream_id);
+
+    assert_eq!(
+        s.client.try_resume_stream(&stream_id),
+        Err(Ok(Error::StreamNotPaused))
+    );
+    assert_eq!(s.client.get_stream(&stream_id), before);
+}
+
+#[test]
+fn resume_stream_on_a_drained_stream_fails_with_not_paused() {
+    let s = setup();
+    let stream_id = resume_fixture(&s);
+    s.env.ledger().with_mut(|l| l.timestamp += 100);
+    s.client.withdraw(&stream_id);
+    assert_eq!(
+        s.client.get_stream(&stream_id).status,
+        StreamStatus::Drained
+    );
+    let before = s.client.get_stream(&stream_id);
+
+    assert_eq!(
+        s.client.try_resume_stream(&stream_id),
+        Err(Ok(Error::StreamNotPaused))
+    );
+    assert_eq!(s.client.get_stream(&stream_id), before);
+}
+
+#[test]
+fn resume_stream_on_a_cancelled_stream_fails_with_cancelled() {
+    let s = setup();
+    let stream_id = resume_fixture(&s);
+
+    // Cancelled from the paused state, the one a resume would otherwise accept.
+    s.env.ledger().with_mut(|l| l.timestamp += 10);
+    s.client.pause_stream(&stream_id);
+    s.client.cancel_stream(&stream_id);
+    let before = s.client.get_stream(&stream_id);
+
+    assert_eq!(
+        s.client.try_resume_stream(&stream_id),
+        Err(Ok(Error::StreamCancelled))
+    );
+    assert_eq!(s.client.get_stream(&stream_id), before);
+}
+
+#[test]
+fn resume_stream_on_an_unknown_stream_fails_with_not_found() {
+    let s = setup();
+    assert_eq!(
+        s.client.try_resume_stream(&999),
+        Err(Ok(Error::StreamNotFound))
+    );
+}
+
+#[test]
+fn resume_stream_while_the_vault_is_paused_is_blocked_until_unpause() {
+    let s = setup();
+    let stream_id = resume_fixture(&s);
+    s.env.ledger().with_mut(|l| l.timestamp += 10);
+    s.client.pause_stream(&stream_id);
+    let before = s.client.get_stream(&stream_id);
+
+    s.client.pause();
+    assert_eq!(
+        s.client.try_resume_stream(&stream_id),
+        Err(Ok(Error::ContractPaused))
+    );
+    assert_eq!(s.client.get_stream(&stream_id), before);
+
+    s.client.unpause();
+    s.client.resume_stream(&stream_id);
+    assert_eq!(s.client.get_stream(&stream_id).status, StreamStatus::Active);
+}
+
+#[test]
+fn resume_stream_with_a_future_start_keeps_the_cliff() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+    s.env.ledger().with_mut(|l| l.timestamp = 1_000);
+    let start = 2_000;
 fn payable_amount_before_during_and_after_a_pause() {
     let s = setup();
     let stream_id = paused_test_stream(&s);
@@ -7379,6 +7494,59 @@ fn a_cliff_stream_paused_before_its_start_accrues_from_the_resume_time() {
         s.client
             .create_stream_with_start(&s.donor, &s.ngo, &s.token.address, &1_000, &10, &start);
 
+    // Pause and resume while the cliff is still ahead: nothing is paid out.
+    s.env.ledger().with_mut(|l| l.timestamp = 1_200);
+    assert_eq!(s.client.pause_stream(&stream_id), 0);
+    s.env.ledger().with_mut(|l| l.timestamp = 1_400);
+    s.client.resume_stream(&stream_id);
+
+    let resumed = s.client.get_stream(&stream_id);
+    assert_eq!(resumed.status, StreamStatus::Active);
+    assert_eq!(resumed.balance, 1_000);
+    assert_eq!(resumed.start, start);
+    assert_eq!(s.client.pending_accrual(&stream_id), 0);
+
+    // Still before the cliff after resuming; accrual begins only at `start`.
+    s.env.ledger().with_mut(|l| l.timestamp = 1_900);
+    assert_eq!(s.client.pending_accrual(&stream_id), 0);
+    s.env.ledger().with_mut(|l| l.timestamp = 2_050);
+    assert_eq!(s.client.pending_accrual(&stream_id), 500);
+}
+
+#[test]
+fn resume_stream_requires_the_donors_auth() {
+    let s = setup();
+    let stream_id = resume_fixture(&s);
+    s.env.ledger().with_mut(|l| l.timestamp += 10);
+    s.client.pause_stream(&stream_id);
+
+    // Only an unrelated account authorises the call: the donor's auth is missing.
+    let attacker = Address::generate(&s.env);
+    s.env.mock_auths(&[MockAuth {
+        address: &attacker,
+        invoke: &MockAuthInvoke {
+            contract: &s.client.address,
+            fn_name: "resume_stream",
+            args: (stream_id,).into_val(&s.env),
+            sub_invokes: &[],
+        },
+    }]);
+    assert!(s.client.try_resume_stream(&stream_id).is_err());
+    assert_eq!(s.client.get_stream(&stream_id).status, StreamStatus::Paused);
+
+    // The donor's own auth is accepted, and is the one the contract asks for.
+    s.env.mock_auths(&[MockAuth {
+        address: &s.donor,
+        invoke: &MockAuthInvoke {
+            contract: &s.client.address,
+            fn_name: "resume_stream",
+            args: (stream_id,).into_val(&s.env),
+            sub_invokes: &[],
+        },
+    }]);
+    s.client.resume_stream(&stream_id);
+    assert_eq!(s.env.auths()[0].0, s.donor);
+    assert_eq!(s.client.get_stream(&stream_id).status, StreamStatus::Active);
     advance(&s.env, 10);
     assert_eq!(s.client.pause_stream(&stream_id), 0);
 
